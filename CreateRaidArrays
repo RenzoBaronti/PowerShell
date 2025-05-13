@@ -1,70 +1,98 @@
-# Import required Dell Redfish modules
+# Load Dell Redfish modules
 Import-Module "Invoke-CreateVirtualDiskREDFISH.psm1"
 Import-Module "Invoke-AssignUnassignHotspareREDFISH.psm1"
 
-# Define iDRAC and controller info
+# iDRAC login details
 $idrac_ip = "192.168.1.100"
 $idrac_username = "root"
 $idrac_password = "calvin"
-$controller_fqdd = "RAID.Slot.6-1"
 
-# Assume $Drives is already defined and is an array of disk FQDDs
-$driveCount = $Drives.Count
+# Create credential object
+$cred = New-Object System.Management.Automation.PSCredential (
+    $idrac_username, (ConvertTo-SecureString $idrac_password -AsPlainText -Force)
+)
 
-if ($driveCount -eq 2) {
-    Write-Host "Creating RAID 1 with 2 drives..."
+# Get controller list
+$controllerListUrl = "https://$idrac_ip/redfish/v1/Systems/System.Embedded.1/Storage"
+$controllersResp = Invoke-RestMethod -Uri $controllerListUrl -Credential $cred -UseBasicParsing -SkipCertificateCheck
+$controllers = $controllersResp.Members
 
-    Invoke-CreateVirtualDiskREDFISH `
-        -idrac_ip $idrac_ip `
-        -idrac_username $idrac_username `
-        -idrac_password $idrac_password `
-        -create_virtual_disk $controller_fqdd `
-        -raid_level "1" `
-        -pdisks ($Drives -join ",") `
-        -name "RAID1_VD"
+foreach ($controllerUriObj in $controllers) {
+    $controllerUri = $controllerUriObj.'@odata.id'
+    $controllerId = $controllerUri -split "/" | Select-Object -Last 1
+    $driveListUrl = "https://$idrac_ip/redfish/v1/Systems/System.Embedded.1/Storage/$controllerId/Drives"
+    
+    Write-Host "`nChecking controller: $controllerId"
 
-}
-elseif ($driveCount -ge 4) {
-    $usableRAIDDisks = if ($driveCount % 2 -eq 0) {
-        $driveCount  # even, use all
-    } else {
-        $driveCount - 1  # odd, leave 1+ for hot spares
+    try {
+        $driveListResp = Invoke-RestMethod -Uri $driveListUrl -Credential $cred -UseBasicParsing -SkipCertificateCheck
+        $driveRefs = $driveListResp.Members
+        $usableDrives = @()
+
+        foreach ($driveRef in $driveRefs) {
+            $diskUri = "https://$idrac_ip" + $driveRef.'@odata.id'
+            $disk = Invoke-RestMethod -Uri $diskUri -Credential $cred -UseBasicParsing -SkipCertificateCheck
+
+            if ($disk.Status.State -eq "Enabled" -and $disk.Identifiers.DurableName -match "Unconfigured") {
+                $usableDrives += $disk.Id
+            }
+        }
+
+        $driveCount = $usableDrives.Count
+        Write-Host "Found $driveCount usable drive(s): $($usableDrives -join ', ')"
+
+        if ($driveCount -eq 2) {
+            Write-Host "Creating RAID 1..."
+            Invoke-CreateVirtualDiskREDFISH `
+                -idrac_ip $idrac_ip `
+                -idrac_username $idrac_username `
+                -idrac_password $idrac_password `
+                -create_virtual_disk $controllerId `
+                -raid_level "1" `
+                -pdisks ($usableDrives -join ",") `
+                -name "RAID1_VD"
+
+        } elseif ($driveCount -ge 4) {
+            $usableRAIDDisks = if ($driveCount % 2 -eq 0) {
+                $driveCount
+            } else {
+                $driveCount - 1
+            }
+
+            $raidDisks = $usableDrives[0..($usableRAIDDisks - 1)]
+            $spares = if ($usableRAIDDisks -lt $driveCount) {
+                $usableDrives[$usableRAIDDisks..($driveCount - 1)]
+            } else {
+                @()
+            }
+
+            Write-Host "Creating RAID 10 with $($raidDisks.Count) disks..."
+            Invoke-CreateVirtualDiskREDFISH `
+                -idrac_ip $idrac_ip `
+                -idrac_username $idrac_username `
+                -idrac_password $idrac_password `
+                -create_virtual_disk $controllerId `
+                -raid_level "10" `
+                -pdisks ($raidDisks -join ",") `
+                -name "RAID10_VD"
+
+            foreach ($spare in $spares) {
+                Write-Host "Assigning $spare as global hot spare..."
+                Invoke-AssignUnassignHotspareREDFISH `
+                    -idrac_ip $idrac_ip `
+                    -idrac_username $idrac_username `
+                    -idrac_password $idrac_password `
+                    -controller_fqdd $controllerId `
+                    -physical_disk_fqdd $spare `
+                    -assign_unassign "Assign" `
+                    -hotspare_type "Global"
+            }
+
+        } else {
+            Write-Host "Not enough drives for RAID. Skipping controller: $controllerId"
+        }
+
+    } catch {
+        Write-Host "Error processing controller $controllerId : $_"
     }
-
-    $raidDisks = $Drives[0..($usableRAIDDisks - 1)]
-    $spares = if ($usableRAIDDisks -lt $driveCount) {
-        $Drives[$usableRAIDDisks..($driveCount - 1)]
-    } else {
-        @()
-    }
-
-    Write-Host "Creating RAID 10 with $($raidDisks.Count) drives..."
-
-    Invoke-CreateVirtualDiskREDFISH `
-        -idrac_ip $idrac_ip `
-        -idrac_username $idrac_username `
-        -idrac_password $idrac_password `
-        -create_virtual_disk $controller_fqdd `
-        -raid_level "10" `
-        -pdisks ($raidDisks -join ",") `
-        -name "RAID10_VD"
-
-    foreach ($spare in $spares) {
-        Write-Host "Assigning $spare as global hot spare..."
-
-        Invoke-AssignUnassignHotspareREDFISH `
-            -idrac_ip $idrac_ip `
-            -idrac_username $idrac_username `
-            -idrac_password $idrac_password `
-            -controller_fqdd $controller_fqdd `
-            -physical_disk_fqdd $spare `
-            -assign_unassign "Assign" `
-            -hotspare_type "Global"
-    }
-
-}
-else {
-    Write-Host "Invalid drive count. You need either:"
-    Write-Host " - 2 drives for RAID 1"
-    Write-Host " - 4+ drives (even for RAID 10, odd to include hot spares)"
 }
