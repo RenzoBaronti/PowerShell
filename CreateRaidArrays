@@ -1,0 +1,70 @@
+# Import required Dell Redfish modules
+Import-Module "Invoke-CreateVirtualDiskREDFISH.psm1"
+Import-Module "Invoke-AssignUnassignHotspareREDFISH.psm1"
+
+# Define iDRAC and controller info
+$idrac_ip = "192.168.1.100"
+$idrac_username = "root"
+$idrac_password = "calvin"
+$controller_fqdd = "RAID.Slot.6-1"
+
+# Assume $Drives is already defined and is an array of disk FQDDs
+$driveCount = $Drives.Count
+
+if ($driveCount -eq 2) {
+    Write-Host "Creating RAID 1 with 2 drives..."
+
+    Invoke-CreateVirtualDiskREDFISH `
+        -idrac_ip $idrac_ip `
+        -idrac_username $idrac_username `
+        -idrac_password $idrac_password `
+        -create_virtual_disk $controller_fqdd `
+        -raid_level "1" `
+        -pdisks ($Drives -join ",") `
+        -name "RAID1_VD"
+
+}
+elseif ($driveCount -ge 4) {
+    $usableRAIDDisks = if ($driveCount % 2 -eq 0) {
+        $driveCount  # even, use all
+    } else {
+        $driveCount - 1  # odd, leave 1+ for hot spares
+    }
+
+    $raidDisks = $Drives[0..($usableRAIDDisks - 1)]
+    $spares = if ($usableRAIDDisks -lt $driveCount) {
+        $Drives[$usableRAIDDisks..($driveCount - 1)]
+    } else {
+        @()
+    }
+
+    Write-Host "Creating RAID 10 with $($raidDisks.Count) drives..."
+
+    Invoke-CreateVirtualDiskREDFISH `
+        -idrac_ip $idrac_ip `
+        -idrac_username $idrac_username `
+        -idrac_password $idrac_password `
+        -create_virtual_disk $controller_fqdd `
+        -raid_level "10" `
+        -pdisks ($raidDisks -join ",") `
+        -name "RAID10_VD"
+
+    foreach ($spare in $spares) {
+        Write-Host "Assigning $spare as global hot spare..."
+
+        Invoke-AssignUnassignHotspareREDFISH `
+            -idrac_ip $idrac_ip `
+            -idrac_username $idrac_username `
+            -idrac_password $idrac_password `
+            -controller_fqdd $controller_fqdd `
+            -physical_disk_fqdd $spare `
+            -assign_unassign "Assign" `
+            -hotspare_type "Global"
+    }
+
+}
+else {
+    Write-Host "Invalid drive count. You need either:"
+    Write-Host " - 2 drives for RAID 1"
+    Write-Host " - 4+ drives (even for RAID 10, odd to include hot spares)"
+}
